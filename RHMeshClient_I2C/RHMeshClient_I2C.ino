@@ -1,0 +1,516 @@
+//https://www.airspayce.com/mikem/arduino/RadioHead/rf22_mesh_client_8pde-example.html
+// rf22_mesh_client.pde
+// -*- mode: C++ -*-
+// Example sketch showing how to create a simple addressed, routed reliable messaging client
+// with the RHMesh class.
+// It is designed to work with the other examples rf22_mesh_server*
+// Hint: you can simulate other network topologies by setting the 
+// RH_TEST_NETWORK define in RHRouter.h
+// Mesh has much greater memory requirements, and you may need to limit the
+// max message length to prevent wierd crashes
+
+// converted original to work with RF95
+// https://raw.githubusercontent.com/rpsreal/LoRa_Ra-02_Arduino/master/LORA_CLIENT.ino
+
+
+#include <Wire.h>
+#include <RHMesh.h>
+//#include <RH_RF22.h>
+#include <RH_RF95.h>
+#include <SPI.h>
+#include <EEPROM.h>  //set the Arduino address by using Mesh_SetNodeID.ino
+
+// In this small artifical network of 4 nodes,
+#define RH_MESH_MAX_MESSAGE_LEN 50
+#define CLIENT_ADDRESS 1
+#define SERVER1_ADDRESS 4
+#define SERVER2_ADDRESS 3
+#define SERVER3_ADDRESS 2
+
+#define RFM95_CS 10
+#define RFM95_RST 9
+#define RFM95_INT 2
+
+// Change to 434.0 or other frequency, must match RX's freq!
+// https://hackaday.io/project/27791/instructions
+#define RF95_FREQ 434.0
+#define ModemConfig RH_RF95::Bw31_25Cr48Sf512
+
+// What I2C address should be used
+#define I2C_ADDRESS 0x8
+#define I2C_Buffer_Size 32    //size can exceed 32, but I don't use it that way
+
+//in/out registers
+// do NOT use Strings - causes memory issues in Arduino
+// https://forum.arduino.cc/index.php?topic=589640.0
+// http://www.cplusplus.com/reference/cstring/
+volatile char I2Cincoming[I2C_Buffer_Size];             // partial string received from I2C
+volatile char LoRaDataToSend[RH_MESH_MAX_MESSAGE_LEN];    // entire string received from I2C
+volatile char I2Coutgoing[I2C_Buffer_Size];    //ready to send to I2C
+volatile char LoRaDataReceived[RH_MESH_MAX_MESSAGE_LEN];  //results from the radio
+volatile char tempBuffer[13];  //a short buffer to hold messges while the in/out buffers are busy
+
+// Define global variables
+int8_t send_ack=0;   // flag var
+volatile bool LoRaReady = false;       // is the other radio responding
+volatile bool LoRaDataReady = false;   // is the DATA ready to be sent
+volatile bool LoRaDataInLock = false;    // used to prevent overwriting the I2C in-buffer while it is being sent thru the radio
+volatile bool LoRaDataOutLock = false;    // used to prevent overwriting the I2C out-buffer while it is being sent thru the radio
+volatile byte targetNode = 1;             //What address are LoRa messages sent to (#1 is usually the server)
+volatile byte currentPower = 23;          //how mauch power to use for the radio 5 to 23
+volatile int HeartBeatDelayMax = 2500;    //how many timer 'cycles' to wait until retrying SYN
+volatile int HeartBeatDelayCount = 0;     //holds the number of cycles that have passed (see ISR below)
+volatile int currentCommand = 0;          //holds the last command received
+volatile int I2CNextChar = 0;             //holds the position into the buffer that will be sent next request
+#define commandI2CData  11                //incomming buffer holds data
+#define commandI2CDataValidate  111       //return the incomming buffer
+#define commandLoRaSend 99                //mark the string complete, which initiates the send
+#define commandGetRSSI  50                //request the current RSSI value
+#define commandSetTimeout  51             //set a new value for HeartBeatDelayMax
+#define commandGetFrequencyError 52       //request the last measured frequency error. 
+#define commandGetLastSNR 53              //request the Signal-to-noise ratio (SNR) of the last received message
+#define commandGetLoRaStatus  1           //request is radio ready
+#define commandGetInLockStatus  2         //request is in-buffer available
+#define commandGetOutLockStatus  3        //request is out-buffer available
+#define commandGetLoRaDataReady  4        //request is out-buffer completed
+#define commandSetTargetNode  9           //update the current target (where to send LoRa messages)
+#define commandSetPower  10               //update power setting for the radio 5 to 23
+#define commandReset  0                   //reboots the Arduino and the radio
+
+#define asciiSYN 22   //used in LoRa handshaking;  knock, knock
+#define asciiACK 6    //used in LoRa handshaking;  ready
+#define asciiNAK 21   //used in LoRa handshaking; THIS radio is not ready to receive data
+#define asciiEOT 4    //used in LoRa handshaking
+#define asciiENQ 5    //used in LoRa handshaking; remote radio asking if there is any data waiting HERE
+#define asciiSTX 2    //used in LoRa handshaking; remainder of buffer contains data
+#define asciiCAN 24   //used in LoRa handshaking; invalid command (1st byte) received; don't know what to do with it
+#define asciiNUL 0    //indicate empty buffer -end of string; nothing to do here (ignore)
+
+// Singleton instance of the radio driver
+// RH_RF22 driver;
+RH_RF95 driver(RFM95_CS, RFM95_INT);
+
+// Class to manage message delivery and receipt, using the driver declared above
+RHMesh manager(driver, EEPROM.read(0));
+
+//##################################################################################
+// reboot the Arduino
+void(* resetFunc) (void) = 0;//declare reset function at address 0
+
+//##################################################################################
+void setup() 
+{
+  // initialize timer2  (note Time1 is used by Wire.h)
+  // max out the match register and the prescaler
+  // interrupt frequency (Hz) = (Arduino clock speed 16,000,000Hz) / (prescaler * (compare match register + 1))
+  // = 977Hz (fires 977 times per second ~ every ms)
+  // might have to TURN OFF to avoid any conflict with the Radio ISR
+  noInterrupts();           // disable all interrupts
+  TCCR2A = 0;               // set entire TCCR2A register to 0
+  TCCR2B = 0;               // same for TCCR2B
+  TCNT2  = 0;               // initialize counter value to 0
+  OCR2A = 255;              // Max match register = 255
+  TCCR2A |= (1 << WGM21);   // turn on CTC mode
+  TCCR2B |= (1 << CS22);    // Set CS22 bit for 64 prescaler
+  TIMSK2 |= (1 << OCIE2A);  // enable timer compare interrupt
+  interrupts();             // enable all interrupts
+  // done configuring interupts
+  
+  // initiate the I2C
+  Wire.begin(I2C_ADDRESS);      // join i2c bus with address #0x8
+  Wire.onReceive(receiveI2C);   // register event
+  Wire.onRequest(sendI2C);      // sendData is funtion called when Pi requests data
+
+  // manual LoRa reset
+  LoRaReset();
+
+  Serial.begin(115200);
+  if (!manager.init())
+    Serial.println("badinit");
+  // Defaults after init are 434.0MHz, 0.05MHz AFC pull-in, modulation FSK_Rb2_4Fd36
+
+  if (manager.thisAddress()==1) {
+    //this IS the server, so send to another address
+    targetNode = 2;
+  }
+
+  // use config settings to maximize range (12 octet message takes 2 seconds to transmit)
+  // https://www.airspayce.com/mikem/arduino/RadioHead/classRH__RF95.html
+  // https://hackaday.io/project/27791/instructions
+  //driver.setModemConfig(ModemConfig);
+  
+
+  // The default transmitter power is 13dBm, using PA_BOOST.
+  // If you are using RFM95/96/97/98 modules which uses the PA_BOOST transmitter pin, then 
+  // you can set transmitter powers from 5 to 23 dBm:
+  driver.setTxPower(currentPower);
+  
+  Serial.print("addr: "); Serial.println(manager.thisAddress());
+}
+
+
+//##################################################################################
+void loop()
+{
+  //Serial.print("Sending to: ");  Serial.println(targetNode);
+    
+
+  // Send a message to a mesh_server
+  // A route to the destination will be automatically discovered.
+  if (LoRaReady) {
+    //the radio is ready to use
+    if (LoRaDataReady) {
+      //The buffer has been completed. and is ready to send
+      // lock it so it is not overwritten (by an ISR) while being sent
+      LoRaDataInLock = true;
+      //LoRaDataToSend[0] = asciiSTX;  //preface the data with asciiSTX so the recieving side knows it is data
+      //rf95.send((uint8_t *)LoRaDataToSend, strlen(LoRaDataToSend));
+      if (LoRaSend(LoRaDataToSend)) {
+        // send was successful
+        LoRaDataReady = false;    // seting to false until SYN/ACK confirms the other radio is again ready
+        LoRaDataToSend[0]=0x0;    // effectively makes the buffer empty; definately removes the command
+        LoRaDataInLock = false;  // unlock so other routines can update the buffer
+      }
+      else {
+        // data FAILED to send - handle it?
+        Serial.print("Fail to send: "); Serial.println((char*)LoRaDataToSend);
+      }
+    }
+  }
+  else {
+    //the radio needs to be evaluated as functional
+    strncpy(tempBuffer, "ACK", 6);  //use the temp buffer to avoid overwriting the In/Out buffers
+    tempBuffer[3] = 0;
+    if (LoRaSend(tempBuffer)) {
+      // send was successful
+    }
+  }
+
+// check for incoming data
+  if (LoRaReceive()) {
+    //successfully received something
+  }
+}
+
+//##################################################################################
+// when Timer2 hits 3 sec (set above) 
+// set the flag so that next rune another SYN/ACK occurs
+// Timer TURNED OFF to avoid any conflict with the Radio ISR
+ISR(TIMER2_COMPA_vect){
+  if (HeartBeatDelayCount < HeartBeatDelayMax){
+    //haven't waited long enough. increase count, and keep waiting
+    HeartBeatDelayCount++;
+  }
+  else{
+    // waited long enough. set flag to retry SYN and reset counter
+    LoRaReady = false;
+    HeartBeatDelayCount = 0;
+  }
+}
+
+//##################################################################################
+// function that executes whenever data is received from master
+// this function is registered as an event, see setup()
+// Remove all Serial.print from production code (to avoid events within events)
+// https://arduino.stackexchange.com/questions/47947/sending-a-string-from-rpi-to-arduino-working-code
+// https://github.com/porrey/i2c/blob/master/Arduino/i2c_Slave/i2c_Slave.ino
+// void receiveEvent(uint8_t byteCount)
+void receiveI2C(int howMany) {
+  int priorCommand = currentCommand;  //temorarily hold on the older command (to check for repeat calls)
+  while (Wire.available()) { // loop through all in buffer
+      currentCommand = Wire.read();  //the 1st byte is always a command
+      //Serial.print("currentCommand received: "); Serial.println(currentCommand);
+      for (int i = 0; i < howMany-1; i++) {
+        I2Cincoming[i] = Wire.read();
+        //Serial.print("I2Cincoming received: "); Serial.println(I2Cincoming[i]);
+        I2Cincoming[i + 1] = '\0'; //add null after ea. char
+      }
+  
+    switch (currentCommand)
+    {
+      case commandI2CData:
+        // aggregate the incoming parts into a single string
+        //Serial.println((char*)I2Cincoming);
+//        if (strlen(LoRaDataToSend)==0) {
+//          // the string is empty
+//          // set the 1st char (aka the 'command') to indicate the buffer contains data
+//          LoRaDataToSend[0] = asciiSTX;
+//          LoRaDataToSend[1] = asciiNUL;  //ensure end of string
+//        }
+        if (LoRaDataReady) {
+          // buffer still has the previous data in it. wait
+          Serial.println("buffer in-use");
+        }
+        else {
+          //LoRaDataOutLock = true;   //let other routines know the buffer is in-use
+          strncat ( LoRaDataToSend, I2Cincoming, sizeof(LoRaDataToSend) );
+        }
+        break;
+      case commandLoRaSend:
+        // done assembling the data string. start the send process
+        LoRaDataReady = true;
+        //Serial.println("Command LoRaSend");
+        break;
+      case commandI2CDataValidate:
+        //if this is a new request, reset pointer, otherwise leave alone
+        if (priorCommand == currentCommand){
+          //no action at this time
+        }
+        else{
+          //was doing something else before, now a new request, so start at the beginning
+          I2CNextChar = 0;
+        }
+          case commandSetTimeout: {
+        // use a new value for the delay between heartbeats
+        //HeartBeatDelayMax = 5000; 
+        HeartBeatDelayMax = atoi(I2Cincoming);
+        break;
+        }
+          case commandSetTargetNode: {
+        // send LoRa messages to a new target
+        targetNode = atoi(I2Cincoming);
+        break;
+        }
+          case commandSetPower: {
+        // set the amount of power used for the radio
+        currentPower = atoi(I2Cincoming);
+        break;
+        }
+          case commandReset: {
+        // Reboots the LoRa Radio and then the Arduino
+        // use VERY carefully
+        //    normally would not use Serial nor delay in ISR, but hey, it IS rebooting
+        LoRaReset();
+        delay(1000);
+        resetFunc();
+        break;
+        }
+      default: {
+        //didn't match any known command
+        //Serial.print("bad command: ");  Serial.println(currentCommand);
+        }
+    }
+  }
+}
+
+
+//##################################################################################
+// pull the send routine out of the main loop
+// paramater is the char array holding data - by default these are passed by-reference
+// returns: true if successful
+bool LoRaSend(char *outBuffer) {
+  //Serial.print("outBuffer: "); Serial.println(strlen(outBuffer));
+  //Serial.print("target Node: "); Serial.println(targetNode);
+  if (LoRaDataToSend==outBuffer){
+    LoRaDataOutLock = true;   // let other routines know the buffer is in-use
+  }
+  if (manager.sendtoWait(outBuffer, strlen(outBuffer)+1, targetNode) == RH_ROUTER_ERROR_NONE)
+  {
+    //memset(outBuffer, 0, sizeof(outBuffer));  //set array to nulls 
+    outBuffer[0] = 0;   //set buffer to zero-length string
+    // It has been reliably delivered to the next node.
+    //we know the radio works, so reset the counter; reduces chattiness
+    LoRaReady = true;
+    HeartBeatDelayCount = 0;
+    if (LoRaDataToSend==outBuffer){
+      LoRaDataOutLock = false;   //release the buffer
+    }
+    return true;
+  }
+  else {
+     //Serial.println("sendtoWait failed. Are the intermediate mesh servers running?");
+     Serial.println("send fail");
+    LoRaReady = false;  //don't trust the radio since we couldn't send
+    //LoRaDataOutLock = false;   //do NOT release the buffer - otherwise the buffer gets overeritten
+    return false;
+  }
+}
+
+//##################################################################################
+// grab stuff from the radio
+bool LoRaReceive() {
+  uint8_t len = sizeof(LoRaDataReceived);
+  uint8_t msgFrom;    
+  uint8_t msgTo;    
+  uint8_t msgID;    
+  uint8_t msgFlags;    
+  //LoRaDataInLock = true;    // let other routines know the buffer is in-use
+  //LoRaDataReceived[0] = 0;    // set buffer to zero-length; essentially empty the buffer
+  if (manager.recvfromAckTimeout(LoRaDataReceived, &len, 3000, &msgFrom, &msgTo, &msgID, &msgFlags))
+  {
+    Serial.print("from: 0x");
+    Serial.print(msgFrom, HEX);
+    Serial.print(" (");
+    Serial.print(driver.lastRssi(), DEC);
+    Serial.print(",");
+    Serial.print(msgTo);
+    Serial.print(",");
+    Serial.print(msgID);
+    Serial.print(",");
+    Serial.print(msgFlags, BIN);
+    Serial.print("): ");
+    Serial.println((char*)LoRaDataReceived);
+    //LoRaDataReady = false;  //buffer sent, so don't send again
+
+    //we know the radio works, so reset the counter; reduces chattiness
+    LoRaReady = true;
+    HeartBeatDelayCount = 0;
+
+    //LoRaDataInLock = false;   //release the buffer
+    return true;
+  }
+  else
+  {
+    //Serial.println("No reply, is rf22_mesh_server1, rf22_mesh_server2 and rf22_mesh_server3 running?");
+    //Serial.println("No reply");
+    //LoRaReady = false;  //the lack of a message does NOT mean the radio is offline
+    //LoRaDataOutLock = false;   //release the buffer especially if nothing was received
+    return false;
+  }
+}
+
+//##################################################################################
+// function that executes whenever data is requested from the master
+// Remove all Serial.print from production code (to avoid events within events)
+// void requestEvent()
+void sendI2C(){
+    switch (currentCommand)
+    {
+      case commandGetRSSI: {
+        // return the current "received signal strength indicator"
+        //I2C_writeAnything (rf95.lastRssi());  writeanything fails to send chr[] or string to RPi
+        memset(I2Coutgoing, 0, sizeof(I2Coutgoing));  //set array to nulls (so RPi can find the good data)
+        itoa(driver.lastRssi(), I2Coutgoing, 10);
+        //Serial.print("RSSI Requested: "); Serial.println((char*)I2Coutgoing);
+        //Wire.write((char*)I2Coutgoing,10);
+        sendBufferToI2C(I2Coutgoing);  //helper function, defined below
+        break;
+        }
+      case commandGetFrequencyError: {
+        // request the last measured frequency error.
+        // The LoRa receiver estimates the frequency offset between the receiver centre frequency and that
+        //   of the received LoRa signal. This function returns the estimates offset (in Hz) of the last 
+        //   received message. Caution: this measurement is not absolute, but is measured relative to the 
+        //   local receiver's oscillator. Apparent errors may be due to the transmitter, the receiver or both.
+        itoa(driver.frequencyError(), I2Coutgoing, 5);  //the frequencyError function sucks 40 bytes of local memory  maybe comment it out
+        //Serial.print("Frequency Error: "); Serial.println((char*)I2Coutgoing);
+        sendBufferToI2C(I2Coutgoing);  //helper function, defined below
+        break;
+        }
+      case commandGetLastSNR: {
+        // Returns the Signal-to-noise ratio (SNR) of the last received message, as measured by the receiver.
+        itoa(driver.lastSNR(), I2Coutgoing, 5);  
+        //Serial.print("Signal Noise Ratio: "); Serial.println((char*)I2Coutgoing);
+        sendBufferToI2C(I2Coutgoing);  //helper function, defined below
+        break;
+        }
+      case commandI2CDataValidate: {
+        // the RPi wants to check the buffer contains the string it had sent
+        sendBufferToI2C(LoRaDataToSend);  //helper function, defined below
+        break;
+        }
+      case commandLoRaSend:{
+        // done assembling the data string. reply with results
+        strncpy(I2Coutgoing, "Complete", 14);
+        //Serial.print("sentI2Coutgoing: "); Serial.println((char*)I2Coutgoing);
+        sendBufferToI2C(I2Coutgoing);  //helper function, defined below
+        break;
+        }
+      case commandSetTimeout: {
+        // use a new value for the delay between heartbeats
+        itoa(HeartBeatDelayMax, I2Coutgoing, 10);
+        sendBufferToI2C(I2Coutgoing);  //helper function, defined below
+        break;
+        }
+      case commandGetLoRaStatus: {
+        // can this device receive data
+        itoa(LoRaReady, I2Coutgoing, 5);
+        sendBufferToI2C(I2Coutgoing);  //helper function, defined below
+        break;
+        }
+      case commandGetOutLockStatus: {
+        // can this device receive data
+        itoa(LoRaDataOutLock, I2Coutgoing, 5);
+        sendBufferToI2C(I2Coutgoing);  //helper function, defined below
+        break;
+        }
+      case commandGetInLockStatus: {
+        // can this device receive data
+        itoa(LoRaDataInLock, I2Coutgoing, 5);
+        sendBufferToI2C(I2Coutgoing);  //helper function, defined below
+        break;
+        }
+      case commandGetLoRaDataReady: {
+        // can this device receive data
+        itoa(LoRaDataReady, I2Coutgoing, 5);
+        sendBufferToI2C(I2Coutgoing);  //helper function, defined below
+        break;
+        }
+      case commandSetTargetNode: {
+        // use a new value for to send LoRa messages to
+        itoa(targetNode, I2Coutgoing, 10);
+        sendBufferToI2C(I2Coutgoing);  //helper function, defined below
+        break;
+        }
+      case commandSetPower: {
+        // use a new value for to send LoRa messages to
+        itoa(currentPower, I2Coutgoing, 10);
+        sendBufferToI2C(I2Coutgoing);  //helper function, defined below
+        break;
+        }
+      default: {
+        //didn't match any known command
+        //Serial.print("bad command: ");  Serial.println(currentCommand);
+        }
+    }
+  }
+
+//##################################################################################
+// send a buffer to I2C
+// if the buffer is bigger than the max (32) then send it in chunks
+// Start whereever the pointer was left after last request
+// if the passed buffer _is_ the outgoing buffer, just send it
+void sendBufferToI2C(char *outBuffer){
+  //Serial.print("Outging addr: "); Serial.println((long)&I2Coutgoing);
+  //Serial.print("Passed addr: "); Serial.println((long)&outBuffer);
+  if (I2Coutgoing==outBuffer){
+    //the request is to send the outgoig buffer
+    // this is already the right size, just send it
+    //Serial.println("they are equal");
+    //Serial.print("sizeof: "); Serial.println(strlen(I2Coutgoing)+1);
+    Wire.write((char*)I2Coutgoing,strlen(I2Coutgoing)+1);   //just send the useful characters plus the trailing null
+    memset(I2Coutgoing, 0, sizeof(I2Coutgoing));  //set array to nulls (so so next operation starts clean)
+  }
+  else{
+    //the incoming buffer is unknown, so assume it is too big to send all at once
+    memset(I2Coutgoing, 0, sizeof(I2Coutgoing));  //set array to nulls (so RPi can find the good data)
+    int maxChar = I2CNextChar+sizeof(I2Coutgoing);  //stay within the I2C 32 byte limit (note has to be constant because the pointer is updated in the loop
+    int outIdx = 0;   //tried a clever calculation based on th efor-loop - was just easier for the outgog to have a seperate counter
+    for (int idx = I2CNextChar; idx <= maxChar; idx++){
+      if (outBuffer[idx] == 0){
+        //reached the end of the string no reason to continue
+        I2CNextChar = 0;  //next request, start at the begining
+        //memset(outBuffer, 0, sizeof(outBuffer));  //do NOT clear the buffer here; sometimes just want to read the content - not act yet
+        break;
+        }
+      I2Coutgoing[outIdx] = outBuffer[idx];
+      I2CNextChar = idx;  //ready to pick up from here at next request
+      outIdx++;   //keep the local index in-step with the main pointer
+      }
+      Wire.write((char*)I2Coutgoing,I2C_Buffer_Size);
+      //Serial.print("I2Coutgoing: "); Serial.println((char*)I2Coutgoing);
+    //Serial.print("LoRaDataToSend: "); Serial.println((char*)LoRaDataToSend); 
+  }
+}
+
+//##################################################################################
+// manual LoRa reset
+void LoRaReset(void) {
+  pinMode(RFM95_RST, OUTPUT);
+  digitalWrite(RFM95_RST, HIGH);
+  delay(100);
+  digitalWrite(RFM95_RST, LOW);
+  delay(10);
+  digitalWrite(RFM95_RST, HIGH);
+  delay(10);
+}
